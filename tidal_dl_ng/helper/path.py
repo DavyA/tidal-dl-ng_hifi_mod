@@ -21,6 +21,10 @@ from tidal_dl_ng.constants import (
     MediaType,
 )
 from tidal_dl_ng.helper.tidal import name_builder_album_artist, name_builder_artist, name_builder_title
+from tidal_dl_ng.wrapper_metadata import WrapperTrack
+
+TRACK_TYPES = (Track, WrapperTrack)
+TRACK_OR_VIDEO_TYPES = TRACK_TYPES + (Video,)
 
 
 def path_home() -> str:
@@ -164,7 +168,7 @@ def _format_artist_names(
     Returns:
         str | None: The formatted artist name or None if the format string is not artist-related.
     """
-    if name == "artist_name" and isinstance(media, Track | Video):
+    if name == "artist_name" and isinstance(media, TRACK_OR_VIDEO_TYPES):
         if hasattr(media, "artists"):
             return name_builder_artist(media)
         elif hasattr(media, "artist"):
@@ -191,7 +195,7 @@ def _format_titles(
     Returns:
         str | None: The formatted title or None if the format string is not title-related.
     """
-    if name == "track_title" and isinstance(media, Track | Video):
+    if name == "track_title" and isinstance(media, TRACK_OR_VIDEO_TYPES):
         return name_builder_title(media)
     elif name == "mix_name" and isinstance(media, Mix):
         return media.title
@@ -200,7 +204,7 @@ def _format_titles(
     elif name == "album_title":
         if isinstance(media, Album):
             return media.name
-        elif isinstance(media, Track):
+        elif isinstance(media, TRACK_TYPES):
             return media.album.name
     return None
 
@@ -250,15 +254,15 @@ def _format_numbers(
     Returns:
         str | None: The formatted number or None if the format string is not number-related.
     """
-    if name == "album_track_num" and isinstance(media, Track | Video):
+    if name == "album_track_num" and isinstance(media, TRACK_OR_VIDEO_TYPES):
         return calculate_number_padding(
             album_track_num_pad_min,
             media.track_num,
             media.album.num_tracks if hasattr(media, "album") else 1,
         )
-    elif name == "album_num_tracks" and isinstance(media, Track | Video):
+    elif name == "album_num_tracks" and isinstance(media, TRACK_OR_VIDEO_TYPES):
         return str(media.album.num_tracks if hasattr(media, "album") else 1)
-    elif name == "list_pos" and isinstance(media, Track | Video):
+    elif name == "list_pos" and isinstance(media, TRACK_OR_VIDEO_TYPES):
         # TODO: Rename `album_track_num_pad_min` globally.
         return calculate_number_padding(album_track_num_pad_min, list_pos, list_total)
     return None
@@ -281,7 +285,7 @@ def _format_ids(
     """
     # Handle track and playlist IDs
     if (
-        (name == "track_id" and isinstance(media, Track))
+        (name == "track_id" and isinstance(media, TRACK_TYPES))
         or (name == "playlist_id" and isinstance(media, Playlist))
         or (name == "video_id" and isinstance(media, Video))
     ):
@@ -290,10 +294,10 @@ def _format_ids(
     elif name == "album_id":
         if isinstance(media, Album):
             return str(media.id)
-        elif isinstance(media, Track):
+        elif isinstance(media, TRACK_TYPES):
             return str(media.album.id)
     # Handle ISRC
-    elif name == "isrc" and isinstance(media, Track):
+    elif name == "isrc" and isinstance(media, TRACK_TYPES):
         return media.isrc
     return None
 
@@ -314,9 +318,9 @@ def _format_durations(
         str | None: The formatted duration or None if the format string is not duration-related.
     """
     # Format track durations
-    if name == "track_duration_seconds" and isinstance(media, Track | Video):
+    if name == "track_duration_seconds" and isinstance(media, TRACK_OR_VIDEO_TYPES):
         return str(media.duration)
-    elif name == "track_duration_minutes" and isinstance(media, Track | Video):
+    elif name == "track_duration_minutes" and isinstance(media, TRACK_OR_VIDEO_TYPES):
         m, s = divmod(media.duration, 60)
         return f"{m:01d}:{s:02d}"
 
@@ -355,12 +359,12 @@ def _format_dates(
     if name == "album_year":
         if isinstance(media, Album):
             return str(media.year)
-        elif isinstance(media, Track):
+        elif isinstance(media, TRACK_TYPES):
             return str(media.album.year)
     elif name == "album_date":
         if isinstance(media, Album):
             return media.release_date.strftime("%Y-%m-%d") if media.release_date else None
-        elif isinstance(media, Track):
+        elif isinstance(media, TRACK_TYPES):
             return media.album.release_date.strftime("%Y-%m-%d") if media.album.release_date else None
 
     return None
@@ -383,9 +387,9 @@ def _format_metadata(
     """
     if name == "video_quality" and isinstance(media, Video):
         return media.video_quality
-    elif name == "track_quality" and isinstance(media, Track):
+    elif name == "track_quality" and isinstance(media, TRACK_TYPES):
         return ", ".join(tag for tag in media.media_metadata_tags if tag is not None)
-    elif (name == "track_explicit" and isinstance(media, Track | Video)) or (
+    elif (name == "track_explicit" and isinstance(media, TRACK_OR_VIDEO_TYPES)) or (
         name == "album_explicit" and isinstance(media, Album)
     ):
         return FORMAT_TEMPLATE_EXPLICIT if media.explicit else ""
@@ -409,12 +413,12 @@ def _format_volumes(
     """
     if name == "album_num_volumes" and isinstance(media, Album):
         return str(media.num_volumes)
-    elif name == "track_volume_num" and isinstance(media, Track | Video):
+    elif name == "track_volume_num" and isinstance(media, TRACK_OR_VIDEO_TYPES):
         return str(media.volume_num)
-    elif name == "track_volume_num_optional" and isinstance(media, Track | Video):
+    elif name == "track_volume_num_optional" and isinstance(media, TRACK_OR_VIDEO_TYPES):
         num_volumes: int = media.album.num_volumes if hasattr(media, "album") else 1
         return "" if num_volumes == 1 else str(media.volume_num)
-    elif name == "track_volume_num_optional_CD" and isinstance(media, Track | Video):
+    elif name == "track_volume_num_optional_CD" and isinstance(media, TRACK_OR_VIDEO_TYPES):
         num_volumes: int = media.album.num_volumes if hasattr(media, "album") else 1
         return "" if num_volumes == 1 else f"CD{media.volume_num!s}"
     return None

@@ -8,19 +8,26 @@ from tidalapi.user import LoggedInUser
 
 from tidal_dl_ng.constants import FAVORITES, MediaType
 from tidal_dl_ng.helper.exceptions import MediaUnknown
+from tidal_dl_ng.wrapper_metadata import WrapperTrack
 
 
-def name_builder_artist(media: Track | Video | Album) -> str:
-    return "; ".join(artist.name for artist in media.artists)
+def name_builder_artist(media) -> str:
+    artists = getattr(media, "artists", []) or []
+    return "; ".join(getattr(artist, "name", "Unknown Artist") for artist in artists)
 
 
-def name_builder_album_artist(media: Track | Album, first_only: bool = False) -> str:
-    artists_tmp: [str] = []
-    artists: [Artist] = media.album.artists if isinstance(media, Track) else media.artists
+def name_builder_album_artist(media: Track | Album | WrapperTrack, first_only: bool = False) -> str:
+    artists_tmp: list[str] = []
+
+    if hasattr(media, "album") and getattr(media.album, "artists", None):
+        artists = media.album.artists
+    else:
+        artists = getattr(media, "artists", [])
 
     for artist in artists:
-        if Role.main in artist.roles:
-            artists_tmp.append(artist.name)
+        roles = getattr(artist, "roles", [])
+        if Role.main in roles:
+            artists_tmp.append(getattr(artist, "name", "Unknown Artist"))
 
         if first_only:
             break
@@ -28,7 +35,7 @@ def name_builder_album_artist(media: Track | Album, first_only: bool = False) ->
     return "; ".join(artists_tmp)
 
 
-def name_builder_title(media: Track | Video | Mix | Playlist | Album | Video) -> str:
+def name_builder_title(media: Track | WrapperTrack | Video | Mix | Playlist | Album) -> str:
     result: str = (
         media.title if isinstance(media, Mix) else media.full_name if hasattr(media, "full_name") else media.name
     )
@@ -36,7 +43,7 @@ def name_builder_title(media: Track | Video | Mix | Playlist | Album | Video) ->
     return result
 
 
-def name_builder_item(media: Track | Video) -> str:
+def name_builder_item(media: Track | WrapperTrack | Video) -> str:
     return f"{name_builder_artist(media)} - {name_builder_title(media)}"
 
 

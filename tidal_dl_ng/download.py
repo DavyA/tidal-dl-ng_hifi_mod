@@ -27,7 +27,6 @@ from requests.adapters import HTTPAdapter, Retry
 from requests.exceptions import HTTPError
 from rich.progress import Progress, TaskID
 from tidalapi import Album, Mix, Playlist, Session, Track, UserPlaylist, Video
-from tidalapi.exceptions import TooManyRequests
 from tidalapi.media import AudioExtensions, Codec, Quality, Stream, StreamManifest, VideoExtensions
 
 from tidal_dl_ng.config import Settings
@@ -62,6 +61,17 @@ from tidal_dl_ng.helper.tidal import (
 from tidal_dl_ng.metadata import Metadata
 from tidal_dl_ng.model.downloader import DownloadSegmentResult
 from tidal_dl_ng.model.gui_data import ProgressBars
+from tidal_dl_ng.wrapper_api import (
+    QUALITY_STRING_MAP,
+    WrappedStream,
+    WrapperApiError,
+    WrapperStreamManifest,
+    fetch_track_stream,
+)
+from tidal_dl_ng.wrapper_metadata import WrapperTrack
+
+TRACK_TYPES = (Track, WrapperTrack)
+MEDIA_ITEM_TYPES = TRACK_TYPES + (Video,)
 
 
 # TODO: Set appropriate client string and use it for video download.
@@ -155,20 +165,20 @@ class Download:
 
     def _get_media_urls(
         self,
-        media: Track | Video,
+        media: Track | WrapperTrack | Video,
         stream_manifest: StreamManifest | None = None,
     ) -> list[str]:
         """Extract URLs for the given media item.
 
         Args:
-            media (Track | Video): The media item to download.
+            media (Track | WrapperTrack | Video): The media item to download.
             stream_manifest (StreamManifest | None, optional): Stream manifest for tracks. Defaults to None.
 
         Returns:
             list[str]: List of URLs for the media segments.
         """
         # Get urls for media.
-        if isinstance(media, Track):
+        if isinstance(media, TRACK_TYPES):
             return stream_manifest.get_urls()
         elif isinstance(media, Video):
             quality_video = self.settings.data.quality_video
@@ -292,7 +302,7 @@ class Download:
         result_segments: bool,
         path_file: pathlib.Path,
         dl_segment_results: list[DownloadSegmentResult],
-        media: Track | Video,
+        media: Track | WrapperTrack | Video,
         stream_manifest: StreamManifest | None = None,
     ) -> tuple[bool, pathlib.Path]:
         """Merge segments, decrypt if needed, and return the final file path.
@@ -319,7 +329,7 @@ class Download:
 
             if not result_merge:
                 self.fn_logger.error(f"Something went wrong while writing to {media.name}. File is corrupt!")
-            elif isinstance(media, Track) and stream_manifest.is_encrypted:
+            elif isinstance(media, TRACK_TYPES) and stream_manifest.is_encrypted:
                 key, nonce = decrypt_security_token(stream_manifest.encryption_key)
                 tmp_path_file_decrypted = path_file.with_suffix(".decrypted")
 
@@ -329,14 +339,14 @@ class Download:
 
     def _download(
         self,
-        media: Track | Video,
+        media: Track | WrapperTrack | Video,
         path_file: pathlib.Path,
         stream_manifest: StreamManifest | None = None,
     ) -> tuple[bool, pathlib.Path]:
         """Download a media item (track or video), handling segments and merging.
 
         Args:
-            media (Track | Video): The media item to download.
+            media (Track | WrapperTrack | Video): The media item to download.
             path_file (pathlib.Path): Path to the output file.
             stream_manifest (StreamManifest | None, optional): Stream manifest for tracks. Defaults to None.
 
@@ -502,7 +512,7 @@ class Download:
         file_template: str,
         media_id: str | None = None,
         media_type: MediaType | None = None,
-        media: Track | Video | None = None,
+        media: Track | WrapperTrack | Video | None = None,
         video_download: bool = True,
         download_delay: bool = False,
         quality_audio: Quality | None = None,
@@ -517,7 +527,7 @@ class Download:
             file_template (str): Template for file naming.
             media_id (str | None, optional): Media ID. Defaults to None.
             media_type (MediaType | None, optional): Media type. Defaults to None.
-            media (Track | Video | None, optional): Media item. Defaults to None.
+            media (Track | WrapperTrack | Video | None, optional): Media item. Defaults to None.
             video_download (bool, optional): Whether to allow video downloads. Defaults to True.
             download_delay (bool, optional): Whether to delay between downloads. Defaults to False.
             quality_audio (Quality | None, optional): Audio quality. Defaults to None.
@@ -531,7 +541,7 @@ class Download:
         """
         # Step 1: Validate and prepare media
         validated_media = self._validate_and_prepare_media(media, media_id, media_type, video_download)
-        if validated_media is None or not isinstance(validated_media, Track | Video):
+        if validated_media is None or not isinstance(validated_media, MEDIA_ITEM_TYPES):
             return False, ""
 
         media = validated_media
@@ -570,11 +580,11 @@ class Download:
 
     def _validate_and_prepare_media(
         self,
-        media: Track | Video | Album | Playlist | UserPlaylist | Mix | None,
+        media: Track | WrapperTrack | Video | Album | Playlist | UserPlaylist | Mix | None,
         media_id: str | None,
         media_type: MediaType | None,
         video_download: bool = True,
-    ) -> Track | Video | Album | Playlist | UserPlaylist | Mix | None:
+    ) -> Track | WrapperTrack | Video | Album | Playlist | UserPlaylist | Mix | None:
         """Validate and prepare media instance for download.
 
         Args:
@@ -591,16 +601,24 @@ class Download:
                 # If no media instance is provided, we need to create the media instance.
                 # Throws `tidalapi.exceptions.ObjectNotFound` if item is not available anymore.
                 media = instantiate_media(self.session, media_type, media_id)
-            elif isinstance(media, Track | Video):
+            elif isinstance(media, Track):
                 # Check if media is available not deactivated / removed from TIDAL.
                 if not media.available:
                     self.fn_logger.info(
                         f"This item is not available for listening anymore on TIDAL. Skipping: {name_builder_item(media)}"
                     )
                     return None
-                elif isinstance(media, Track):
-                    # Re-create media instance with full album information
-                    media = self.session.track(str(media.id), with_album=True)
+                # Re-create media instance with full album information
+                media = self.session.track(str(media.id), with_album=True)
+            elif isinstance(media, WrapperTrack):
+                # Wrapper track metadata already contains the necessary information.
+                pass
+            elif isinstance(media, Video):
+                if not media.available:
+                    self.fn_logger.info(
+                        f"This item is not available for listening anymore on TIDAL. Skipping: {name_builder_item(media)}"
+                    )
+                    return None
             elif isinstance(media, Album):
                 # Check if media is available not deactivated / removed from TIDAL.
                 if not media.available:
@@ -624,7 +642,7 @@ class Download:
 
     def _prepare_file_paths_and_skip_logic(
         self,
-        media: Track | Video,
+        media: Track | WrapperTrack | Video,
         file_template: str,
         quality_audio: Quality | None,
         list_position: int,
@@ -633,7 +651,7 @@ class Download:
         """Prepare file paths and determine skip logic.
 
         Args:
-            media (Track | Video): Media item.
+            media (Track | WrapperTrack | Video): Media item.
             file_template (str): Template for file naming.
             quality_audio (Quality | None): Audio quality setting.
             list_position (int): Position in list.
@@ -715,7 +733,7 @@ class Download:
 
     def _download_and_process_media(
         self,
-        media: Track | Video,
+        media: Track | WrapperTrack | Video,
         path_media_dst: pathlib.Path,
         skip_download: bool,
         is_parent_album: bool,
@@ -724,7 +742,7 @@ class Download:
         """Download and process media file.
 
         Args:
-            media (Track | Video): Media item.
+            media (Track | WrapperTrack | Video): Media item.
             path_media_dst (pathlib.Path): Destination file path.
             skip_download (bool): Whether to skip download.
             is_parent_album (bool): Whether this is a parent album.
@@ -739,7 +757,7 @@ class Download:
         # Get stream information and final file extension
         stream_manifest, file_extension, do_flac_extract, media_stream = self._get_stream_info(media)
 
-        if stream_manifest is None and isinstance(media, Track):
+        if stream_manifest is None and isinstance(media, TRACK_TYPES):
             return False
 
         # Update path if extension changed
@@ -754,39 +772,63 @@ class Download:
             media, path_media_dst, stream_manifest, do_flac_extract, is_parent_album, media_stream
         )
 
-    def _get_stream_info(self, media: Track | Video) -> tuple[StreamManifest | None, str, bool, Stream | None]:
+    def _get_stream_info(
+        self, media: Track | WrapperTrack | Video
+    ) -> tuple[StreamManifest | WrapperStreamManifest | None, str, bool, Stream | WrappedStream | None]:
         """Get stream information for media.
 
         Args:
-            media (Track | Video): Media item.
+            media (Track | WrapperTrack | Video): Media item.
 
         Returns:
-            tuple[StreamManifest | None, str, bool, Stream | None]: Stream info.
+            tuple[StreamManifest | WrapperStreamManifest | None, str, bool, Stream | WrappedStream | None]: Stream info.
         """
-        stream_manifest: StreamManifest | None = None
-        media_stream: Stream | None = None
+        stream_manifest: StreamManifest | WrapperStreamManifest | None = None
+        media_stream: Stream | WrappedStream | None = None
         do_flac_extract: bool = False
 
-        if isinstance(media, Track):
+        if isinstance(media, TRACK_TYPES):
+            log_debug = getattr(self.fn_logger, "debug", None)
+
             try:
-                media_stream = media.get_stream()
-                stream_manifest = media_stream.get_stream_manifest()
-            except TooManyRequests:
+                stream_manifest, media_stream, delivered_quality = fetch_track_stream(
+                    media.id,
+                    self.session.audio_quality,
+                    logger=log_debug,
+                )
+            except WrapperApiError:
                 self.fn_logger.exception(
-                    f"Too many requests against TIDAL backend. Skipping '{name_builder_item(media)}'. "
-                    f"Consider to activate delay between downloads."
+                    f"Wrapper API could not provide stream data. Skipping '{name_builder_item(media)}'."
                 )
 
                 return None, "", False, None
             except Exception:
-                self.fn_logger.exception(f"Something went wrong. Skipping '{name_builder_item(media)}'.")
+                self.fn_logger.exception(
+                    f"Unexpected error while contacting wrapper API. Skipping '{name_builder_item(media)}'."
+                )
 
                 return None, "", False, None
 
+            requested_quality_label = QUALITY_STRING_MAP.get(self.session.audio_quality, "").upper()
+            delivered_quality_label = delivered_quality.upper() if isinstance(delivered_quality, str) else ""
+
+            if (
+                requested_quality_label
+                and delivered_quality_label
+                and delivered_quality_label != requested_quality_label
+            ):
+                self.fn_logger.info(
+                    f"Requested '{requested_quality_label}' for '{name_builder_item(media)}' but received "
+                    f"'{delivered_quality_label}' from wrapper API."
+                )
+
             file_extension = stream_manifest.file_extension
 
-            if self.settings.data.extract_flac and (
-                stream_manifest.codecs.upper() == Codec.FLAC and file_extension != AudioExtensions.FLAC
+            if (
+                self.settings.data.extract_flac
+                and stream_manifest.codecs
+                and stream_manifest.codecs.upper() == Codec.FLAC
+                and file_extension != AudioExtensions.FLAC
             ):
                 file_extension = AudioExtensions.FLAC
                 do_flac_extract = True
@@ -797,22 +839,22 @@ class Download:
 
     def _perform_actual_download(
         self,
-        media: Track | Video,
+        media: Track | WrapperTrack | Video,
         path_media_dst: pathlib.Path,
-        stream_manifest: StreamManifest | None,
+        stream_manifest: StreamManifest | WrapperStreamManifest | None,
         do_flac_extract: bool,
         is_parent_album: bool,
-        media_stream: Stream | None,
+        media_stream: Stream | WrappedStream | None,
     ) -> bool:
         """Perform the actual download and processing.
 
         Args:
-            media (Track | Video): Media item.
+            media (Track | WrapperTrack | Video): Media item.
             path_media_dst (pathlib.Path): Destination file path.
-            stream_manifest (StreamManifest | None): Stream manifest.
+            stream_manifest (StreamManifest | WrapperStreamManifest | None): Stream manifest object.
             do_flac_extract (bool): Whether to extract FLAC.
             is_parent_album (bool): Whether this is a parent album.
-            media_stream (Stream | None): Media stream.
+            media_stream (Stream | WrappedStream | None): Media stream metadata.
 
         Returns:
             bool: Whether download was successful.
@@ -835,7 +877,7 @@ class Download:
                 tmp_path_file = self._video_convert(tmp_path_file)
 
             # Extract FLAC from MP4 container using ffmpeg
-            if isinstance(media, Track) and self.settings.data.extract_flac and do_flac_extract:
+            if isinstance(media, TRACK_TYPES) and self.settings.data.extract_flac and do_flac_extract:
                 tmp_path_file = self._extract_flac(tmp_path_file)
 
             # Handle metadata, lyrics, and cover
@@ -850,16 +892,16 @@ class Download:
 
     def _handle_metadata_and_extras(
         self,
-        media: Track | Video,
+        media: Track | WrapperTrack | Video,
         tmp_path_file: pathlib.Path,
         path_media_dst: pathlib.Path,
         is_parent_album: bool,
-        media_stream: Stream | None,
+        media_stream: Stream | WrappedStream | None,
     ) -> None:
         """Handle metadata, lyrics, and cover processing.
 
         Args:
-            media (Track | Video): Media item.
+            media (Track | WrapperTrack | Video): Media item.
             tmp_path_file (pathlib.Path): Temporary file path.
             path_media_dst (pathlib.Path): Destination file path.
             is_parent_album (bool): Whether this is a parent album.
@@ -934,7 +976,7 @@ class Download:
             time.sleep(time_sleep)
 
     def media_move_and_symlink(
-        self, media: Track | Video, path_media_src: pathlib.Path, file_extension: str
+        self, media: Track | WrapperTrack | Video, path_media_src: pathlib.Path, file_extension: str
     ) -> pathlib.Path:
         """Move a media file and create a symlink if required.
 
@@ -1141,15 +1183,19 @@ class Download:
         return result
 
     def metadata_write(
-        self, track: Track, path_media: pathlib.Path, is_parent_album: bool, media_stream: Stream
+        self,
+        track: Track | WrapperTrack,
+        path_media: pathlib.Path,
+        is_parent_album: bool,
+        media_stream: Stream | WrappedStream,
     ) -> tuple[bool, pathlib.Path | None, pathlib.Path | None]:
         """Write metadata, lyrics, and cover to a media file.
 
         Args:
-            track (Track): Track object.
+            track (Track | WrapperTrack): Track object.
             path_media (pathlib.Path): Path to media file.
             is_parent_album (bool): Whether this is a parent album.
-            media_stream (Stream): Stream object.
+            media_stream (Stream | WrappedStream): Stream data source.
 
         Returns:
             tuple[bool, pathlib.Path | None, pathlib.Path | None]: (Success, path to lyrics, path to cover)

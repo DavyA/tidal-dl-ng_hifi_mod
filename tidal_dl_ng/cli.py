@@ -30,8 +30,9 @@ from tidal_dl_ng.helper.tidal import (
     instantiate_media,
     url_ending_clean,
 )
-from tidal_dl_ng.helper.wrapper import LoggerWrapped
+from tidal_dl_ng.helper.wrapper import LoggerWrapped, skip_login_required
 from tidal_dl_ng.model.cfg import HelpSettings
+from tidal_dl_ng.wrapper_metadata import WrapperMetadataError, instantiate_media_wrapper
 
 app = typer.Typer(context_settings={"help_option_names": ["-h", "--help"]}, add_completion=False)
 app_dl_fav = typer.Typer(
@@ -66,7 +67,7 @@ def callback_app(
         ctx (typer.Context): Typer context object.
         version (bool | None, optional): Version flag. Defaults to None.
     """
-    ctx.obj = {"tidal": None}
+    ctx.obj = {CTX_TIDAL: None, "skip_login": True}
 
 
 def _handle_track_or_video(
@@ -191,11 +192,27 @@ def _process_url(
         print(f"Could not determine file template for: {url_clean}")
         return True
 
-    try:
-        media = instantiate_media(ctx.obj[CTX_TIDAL].session, media_type, url_clean_id)
-    except Exception:
-        print(f"Media not found (ID: {url_clean_id}). Maybe it is not available anymore.")
-        return True
+    skip_login: bool = ctx.obj.get("skip_login", False)
+    media = None
+
+    if skip_login:
+        try:
+            media = instantiate_media_wrapper(media_type, url_clean_id)
+        except NotImplementedError:
+            print(
+                "Anonymous mode currently supports track downloads only. Please login for other media types."
+            )
+            return True
+        except WrapperMetadataError as exc:
+            print(f"Media not found (ID: {url_clean_id}). Wrapper error: {exc}.")
+            return True
+
+    if media is None:
+        try:
+            media = instantiate_media(ctx.obj[CTX_TIDAL].session, media_type, url_clean_id)
+        except Exception:
+            print(f"Media not found (ID: {url_clean_id}). Maybe it is not available anymore.")
+            return True
 
     if media_type in [MediaType.TRACK, MediaType.VIDEO]:
         _handle_track_or_video(dl, ctx, url_clean, media, file_template, idx, urls_pos_last)
@@ -204,21 +221,24 @@ def _process_url(
     return True
 
 
-def _download(ctx: typer.Context, urls: list[str], try_login: bool = True) -> bool:
+def _download(ctx: typer.Context, urls: list[str]) -> bool:
     """Invokes download function and tracks progress.
 
     Args:
         ctx (typer.Context): The typer context object.
         urls (list[str]): The list of URLs to download.
-        try_login (bool, optional): If true, attempts to login to TIDAL. Defaults to True.
-
     Returns:
         bool: True if ran successfully.
     """
-    if try_login:
-        ctx.invoke(login, ctx)
+    tidal = ctx.obj.get(CTX_TIDAL)
 
-    settings: Settings = ctx.obj[CTX_TIDAL].settings
+    if tidal is None:
+        tidal = Tidal(Settings())
+        ctx.obj[CTX_TIDAL] = tidal
+
+    ctx.obj.setdefault("skip_login", True)
+
+    settings: Settings = tidal.settings
     handling_app: HandlingApp = HandlingApp()
 
     progress: Progress = Progress(
@@ -246,7 +266,7 @@ def _download(ctx: typer.Context, urls: list[str], try_login: bool = True) -> bo
     fn_logger = LoggerWrapped(progress.print)
 
     dl = Download(
-        session=ctx.obj[CTX_TIDAL].session,
+        session=tidal.session,
         skip_existing=settings.data.skip_existing,
         path_base=settings.data.download_base_path,
         fn_logger=fn_logger,
@@ -361,6 +381,7 @@ def logout() -> bool:
 
 
 @app.command(name="dl")
+@skip_login_required
 def download(
     ctx: typer.Context,
     urls: Annotated[list[str] | None, typer.Argument()] = None,
@@ -491,7 +512,8 @@ def _download_fav_factory(ctx: typer.Context, func_name_favorites: str) -> bool:
     ctx.invoke(login, ctx)
     func_favorites: Callable = getattr(ctx.obj[CTX_TIDAL].session.user.favorites, func_name_favorites)
     media_urls: list[str] = [media.share_url for media in func_favorites()]
-    return _download(ctx, media_urls, try_login=False)
+    ctx.obj["skip_login"] = True
+    return _download(ctx, media_urls)
 
 
 @app.command()

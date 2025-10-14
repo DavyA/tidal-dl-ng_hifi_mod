@@ -1,4 +1,10 @@
 from collections.abc import Callable
+from functools import wraps
+
+import typer
+
+from tidal_dl_ng.config import Settings, Tidal
+from tidal_dl_ng.constants import CTX_TIDAL
 
 
 class LoggerWrapped:
@@ -24,3 +30,21 @@ class LoggerWrapped:
 
     def exception(self, value):
         self.fn_print(value)
+
+
+def skip_login_required(func: Callable):
+    """Decorator to ensure a TIDAL context exists while bypassing login."""
+
+    @wraps(func)
+    def wrapper(ctx: typer.Context, *args, **kwargs):
+        tidal = ctx.obj.get(CTX_TIDAL)
+
+        if tidal is None:
+            tidal = Tidal(Settings())
+            ctx.obj[CTX_TIDAL] = tidal
+
+        ctx.obj["skip_login"] = True
+
+        return func(ctx, *args, **kwargs)
+
+    return wrapper
