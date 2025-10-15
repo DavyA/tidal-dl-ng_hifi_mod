@@ -71,6 +71,7 @@ class WrapperTrack:
     audio_quality: str
     explicit: bool
     available: bool
+    playlist_name: str | None = None
 
     @property
     def name(self) -> str:

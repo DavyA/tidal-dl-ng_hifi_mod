@@ -161,7 +161,6 @@ def _download_album_anonymous(
         dl.fn_logger.info(f"No tracks found for album '{album.name}'.")
         return
 
-    file_template_album = format_path_media(file_template, album)
     total = len(tracks)
     result_dirs: set[Path] = set()
 
@@ -171,7 +170,7 @@ def _download_album_anonymous(
         delay_flag = bool(settings.data.download_delay and index < total - 1)
         success, path_media = dl.item(
             media=track,
-            file_template=file_template_album,
+            file_template=file_template,
             quality_audio=settings.data.quality_audio,
             quality_video=settings.data.quality_video,
             download_delay=delay_flag,
@@ -184,7 +183,7 @@ def _download_album_anonymous(
             result_dirs.add(path_media.parent)
 
     if settings.data.playlist_create and result_dirs:
-        sort_by_track_num = "album_track_num" in file_template_album or "list_pos" in file_template_album
+        sort_by_track_num = "album_track_num" in file_template or "list_pos" in file_template
         dl.playlist_populate(result_dirs, album.name, True, sort_by_track_num)
 
 
@@ -199,17 +198,17 @@ def _download_playlist_anonymous(
         dl.fn_logger.info(f"No tracks found for playlist '{playlist.name}'.")
         return
 
-    file_template_playlist = format_path_media(file_template, playlist)
     total = len(tracks)
     result_dirs: set[Path] = set()
 
     dl.fn_logger.info(f"Downloading playlist '{playlist.name}' with {total} tracks via wrapper API.")
 
     for index, track in enumerate(tracks):
+        setattr(track, "playlist_name", playlist.name)
         delay_flag = bool(settings.data.download_delay and index < total - 1)
         success, path_media = dl.item(
             media=track,
-            file_template=file_template_playlist,
+            file_template=file_template,
             quality_audio=settings.data.quality_audio,
             quality_video=settings.data.quality_video,
             download_delay=delay_flag,
@@ -222,7 +221,7 @@ def _download_playlist_anonymous(
             result_dirs.add(path_media.parent)
 
     if settings.data.playlist_create and result_dirs:
-        sort_by_track_num = "album_track_num" in file_template_playlist or "list_pos" in file_template_playlist
+        sort_by_track_num = "album_track_num" in file_template or "list_pos" in file_template
         dl.playlist_populate(result_dirs, playlist.name, False, sort_by_track_num)
 
 

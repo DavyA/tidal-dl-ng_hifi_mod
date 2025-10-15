@@ -177,6 +177,12 @@ def _format_artist_names(
         return name_builder_album_artist(media, first_only=True)
     elif name == "album_artists":
         return name_builder_album_artist(media)
+    elif name == "playlist_name":
+        playlist_name = getattr(media, "playlist_name", None)
+        if playlist_name:
+            return playlist_name
+        if isinstance(media, Playlist | UserPlaylist):
+            return name_builder_title(media)
     return None
 
 
