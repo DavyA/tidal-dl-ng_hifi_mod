@@ -72,6 +72,7 @@ class WrapperTrack:
     explicit: bool
     available: bool
     playlist_name: str | None = None
+    mix_name: str | None = None
 
     @property
     def name(self) -> str:
@@ -98,6 +99,12 @@ class WrapperPlaylist:
     @property
     def title(self) -> str:
         return self.name
+
+
+@dataclass(slots=True)
+class WrapperMix:
+    id: str
+    name: str
 
 
 def _request(endpoint: str, params: dict[str, str | int]) -> dict | list:
@@ -294,6 +301,49 @@ def fetch_playlist_with_tracks(playlist_uuid: str) -> tuple[WrapperPlaylist, lis
         tracks.append(track)
 
     return playlist, tracks
+
+
+def _mix_name_from_html(mix_id: str) -> str:
+    try:
+        resp = requests.get(f"https://tidal.com/mix/{mix_id}", timeout=REQUESTS_TIMEOUT_SEC)
+        resp.raise_for_status()
+        html = resp.text
+        start = html.find("<title>")
+        end = html.find("</title>", start + 7)
+        if start != -1 and end != -1:
+            return html[start + 7 : end].strip() or f"Mix {mix_id}"
+    except Exception:
+        pass
+
+    return f"Mix {mix_id}"
+
+
+def fetch_mix_with_tracks(mix_id: str) -> tuple[WrapperMix, list[WrapperTrack]]:
+    try:
+        payload = _request("mix", {"id": mix_id})
+    except requests.RequestException as exc:
+        raise WrapperMetadataError(f"Failed to retrieve mix data: {exc}") from exc
+
+    if not isinstance(payload, dict):
+        raise WrapperMetadataError("Unexpected mix payload structure.")
+
+    mix = WrapperMix(id=mix_id, name=_mix_name_from_html(mix_id))
+    tracks: list[WrapperTrack] = []
+
+    for entry in payload.get("items", []):
+        track_data = entry.get("item") or entry
+        if not isinstance(track_data, dict):
+            continue
+
+        track_artists = _map_artists(track_data.get("artists") or [])
+        album_fragment = track_data.get("album") or {}
+        album = _build_album_from_fragment(album_fragment, track_artists)
+
+        track = _build_track(track_data, album)
+        track.mix_name = mix.name
+        tracks.append(track)
+
+    return mix, tracks
 
 
 def instantiate_media_wrapper(media_type: MediaType, media_id: str) -> WrapperTrack:

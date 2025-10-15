@@ -35,6 +35,7 @@ from tidal_dl_ng.model.cfg import HelpSettings
 from tidal_dl_ng.wrapper_metadata import (
     WrapperMetadataError,
     fetch_album_with_tracks,
+    fetch_mix_with_tracks,
     fetch_playlist_with_tracks,
     instantiate_media_wrapper,
 )
@@ -225,6 +226,44 @@ def _download_playlist_anonymous(
         dl.playlist_populate(result_dirs, playlist.name, False, sort_by_track_num)
 
 
+def _download_mix_anonymous(
+    dl: Download,
+    settings: Settings,
+    mix_id: str,
+    file_template: str,
+) -> None:
+    mix, tracks = fetch_mix_with_tracks(mix_id)
+    if not tracks:
+        dl.fn_logger.info(f"No tracks found for mix '{mix.name}'.")
+        return
+
+    total = len(tracks)
+    result_dirs: set[Path] = set()
+
+    dl.fn_logger.info(f"Downloading mix '{mix.name}' with {total} tracks via wrapper API.")
+
+    for index, track in enumerate(tracks):
+        track.mix_name = mix.name
+        delay_flag = bool(settings.data.download_delay and index < total - 1)
+        success, path_media = dl.item(
+            media=track,
+            file_template=file_template,
+            quality_audio=settings.data.quality_audio,
+            quality_video=settings.data.quality_video,
+            download_delay=delay_flag,
+            is_parent_album=False,
+            list_position=index + 1,
+            list_total=total,
+        )
+
+        if success and isinstance(path_media, Path):
+            result_dirs.add(path_media.parent)
+
+    if settings.data.playlist_create and result_dirs:
+        sort_by_track_num = "album_track_num" in file_template or "list_pos" in file_template
+        dl.playlist_populate(result_dirs, mix.name, False, sort_by_track_num)
+
+
 def _process_url(
     dl: Download,
     ctx: typer.Context,
@@ -284,6 +323,9 @@ def _process_url(
                 return True
             elif media_type == MediaType.PLAYLIST:
                 _download_playlist_anonymous(dl, settings, url_clean_id, file_template)
+                return True
+            elif media_type == MediaType.MIX:
+                _download_mix_anonymous(dl, settings, url_clean_id, file_template)
                 return True
         except WrapperMetadataError as exc:
             print(f"Media not found (ID: {url_clean_id}). Wrapper error: {exc}.")

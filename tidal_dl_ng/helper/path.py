@@ -203,8 +203,12 @@ def _format_titles(
     """
     if name == "track_title" and isinstance(media, TRACK_OR_VIDEO_TYPES):
         return name_builder_title(media)
-    elif name == "mix_name" and isinstance(media, Mix):
-        return media.title
+    elif name == "mix_name":
+        if isinstance(media, Mix):
+            return media.title
+        mix_name = getattr(media, "mix_name", None)
+        if mix_name:
+            return mix_name
     elif name == "playlist_name" and isinstance(media, Playlist | UserPlaylist):
         return media.name
     elif name == "album_title":
