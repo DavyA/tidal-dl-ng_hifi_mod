@@ -22,7 +22,7 @@ from tidal_dl_ng import __version__
 from tidal_dl_ng.config import HandlingApp, Settings, Tidal
 from tidal_dl_ng.constants import CTX_TIDAL, MediaType
 from tidal_dl_ng.download import Download
-from tidal_dl_ng.helper.path import get_format_template, path_file_settings
+from tidal_dl_ng.helper.path import format_path_media, get_format_template, path_file_settings
 from tidal_dl_ng.helper.tidal import (
     all_artist_album_ids,
     get_tidal_media_id,
@@ -32,7 +32,12 @@ from tidal_dl_ng.helper.tidal import (
 )
 from tidal_dl_ng.helper.wrapper import LoggerWrapped, skip_login_required
 from tidal_dl_ng.model.cfg import HelpSettings
-from tidal_dl_ng.wrapper_metadata import WrapperMetadataError, instantiate_media_wrapper
+from tidal_dl_ng.wrapper_metadata import (
+    WrapperMetadataError,
+    fetch_album_with_tracks,
+    fetch_playlist_with_tracks,
+    instantiate_media_wrapper,
+)
 
 app = typer.Typer(context_settings={"help_option_names": ["-h", "--help"]}, add_completion=False)
 app_dl_fav = typer.Typer(
@@ -145,6 +150,82 @@ def _handle_album_playlist_mix_artist(
     return True
 
 
+def _download_album_anonymous(
+    dl: Download,
+    settings: Settings,
+    album_id: str,
+    file_template: str,
+) -> None:
+    album, tracks = fetch_album_with_tracks(album_id)
+    if not tracks:
+        dl.fn_logger.info(f"No tracks found for album '{album.name}'.")
+        return
+
+    file_template_album = format_path_media(file_template, album)
+    total = len(tracks)
+    result_dirs: set[Path] = set()
+
+    dl.fn_logger.info(f"Downloading album '{album.name}' with {total} tracks via wrapper API.")
+
+    for index, track in enumerate(tracks):
+        delay_flag = bool(settings.data.download_delay and index < total - 1)
+        success, path_media = dl.item(
+            media=track,
+            file_template=file_template_album,
+            quality_audio=settings.data.quality_audio,
+            quality_video=settings.data.quality_video,
+            download_delay=delay_flag,
+            is_parent_album=True,
+            list_position=index + 1,
+            list_total=total,
+        )
+
+        if success and isinstance(path_media, Path):
+            result_dirs.add(path_media.parent)
+
+    if settings.data.playlist_create and result_dirs:
+        sort_by_track_num = "album_track_num" in file_template_album or "list_pos" in file_template_album
+        dl.playlist_populate(result_dirs, album.name, True, sort_by_track_num)
+
+
+def _download_playlist_anonymous(
+    dl: Download,
+    settings: Settings,
+    playlist_id: str,
+    file_template: str,
+) -> None:
+    playlist, tracks = fetch_playlist_with_tracks(playlist_id)
+    if not tracks:
+        dl.fn_logger.info(f"No tracks found for playlist '{playlist.name}'.")
+        return
+
+    file_template_playlist = format_path_media(file_template, playlist)
+    total = len(tracks)
+    result_dirs: set[Path] = set()
+
+    dl.fn_logger.info(f"Downloading playlist '{playlist.name}' with {total} tracks via wrapper API.")
+
+    for index, track in enumerate(tracks):
+        delay_flag = bool(settings.data.download_delay and index < total - 1)
+        success, path_media = dl.item(
+            media=track,
+            file_template=file_template_playlist,
+            quality_audio=settings.data.quality_audio,
+            quality_video=settings.data.quality_video,
+            download_delay=delay_flag,
+            is_parent_album=False,
+            list_position=index + 1,
+            list_total=total,
+        )
+
+        if success and isinstance(path_media, Path):
+            result_dirs.add(path_media.parent)
+
+    if settings.data.playlist_create and result_dirs:
+        sort_by_track_num = "album_track_num" in file_template_playlist or "list_pos" in file_template_playlist
+        dl.playlist_populate(result_dirs, playlist.name, False, sort_by_track_num)
+
+
 def _process_url(
     dl: Download,
     ctx: typer.Context,
@@ -197,12 +278,14 @@ def _process_url(
 
     if skip_login:
         try:
-            media = instantiate_media_wrapper(media_type, url_clean_id)
-        except NotImplementedError:
-            print(
-                "Anonymous mode currently supports track downloads only. Please login for other media types."
-            )
-            return True
+            if media_type == MediaType.TRACK:
+                media = instantiate_media_wrapper(media_type, url_clean_id)
+            elif media_type == MediaType.ALBUM:
+                _download_album_anonymous(dl, settings, url_clean_id, file_template)
+                return True
+            elif media_type == MediaType.PLAYLIST:
+                _download_playlist_anonymous(dl, settings, url_clean_id, file_template)
+                return True
         except WrapperMetadataError as exc:
             print(f"Media not found (ID: {url_clean_id}). Wrapper error: {exc}.")
             return True

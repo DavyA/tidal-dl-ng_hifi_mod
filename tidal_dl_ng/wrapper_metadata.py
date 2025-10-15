@@ -84,6 +84,21 @@ class WrapperTrack:
         return WrapperLyrics()
 
 
+@dataclass(slots=True)
+class WrapperPlaylist:
+    uuid: str
+    name: str
+    description: str | None = None
+
+    @property
+    def id(self) -> str:
+        return self.uuid
+
+    @property
+    def title(self) -> str:
+        return self.name
+
+
 def _request(endpoint: str, params: dict[str, str | int]) -> dict | list:
     response = requests.get(f"{BASE_URL}/{endpoint}", params=params, timeout=REQUESTS_TIMEOUT_SEC)
     response.raise_for_status()
@@ -198,6 +213,86 @@ def fetch_track_metadata(track_id: str | int) -> WrapperTrack:
     album = _build_album(album_data)
 
     return _build_track(track_data, album)
+
+
+def _build_album_from_fragment(fragment: dict, fallback_artists: Iterable[WrapperArtist]) -> WrapperAlbum:
+    artists = _map_artists(fragment.get("artists") or []) or list(fallback_artists)
+    release_date = _parse_date(fragment.get("releaseDate"), "%Y-%m-%d")
+
+    return WrapperAlbum(
+        id=fragment.get("id") or 0,
+        name=fragment.get("title", "Unknown Album"),
+        cover=fragment.get("cover", ""),
+        num_tracks=fragment.get("numberOfTracks") or 0,
+        num_volumes=fragment.get("numberOfVolumes") or 1,
+        upc=fragment.get("upc"),
+        release_date=release_date,
+        available_release_date=release_date,
+        artists=artists,
+        explicit=fragment.get("explicit", False),
+        allow_streaming=fragment.get("allowStreaming", True),
+    )
+
+
+def fetch_album_with_tracks(album_id: str | int) -> tuple[WrapperAlbum, list[WrapperTrack]]:
+    try:
+        payload = _request("album", {"id": album_id})
+    except requests.RequestException as exc:
+        raise WrapperMetadataError(f"Failed to retrieve album metadata: {exc}") from exc
+
+    if not isinstance(payload, list) or len(payload) < 2:
+        raise WrapperMetadataError("Unexpected album payload structure.")
+
+    album_data = payload[0] or {}
+    items_section = payload[1] or {}
+    album = _build_album(album_data)
+
+    tracks: list[WrapperTrack] = []
+
+    for entry in items_section.get("items", []):
+        track_data = entry.get("item") or entry
+        if not isinstance(track_data, dict):
+            continue
+
+        track = _build_track(track_data, album)
+        tracks.append(track)
+
+    return album, tracks
+
+
+def fetch_playlist_with_tracks(playlist_uuid: str) -> tuple[WrapperPlaylist, list[WrapperTrack]]:
+    try:
+        payload = _request("playlist", {"id": playlist_uuid})
+    except requests.RequestException as exc:
+        raise WrapperMetadataError(f"Failed to retrieve playlist metadata: {exc}") from exc
+
+    if not isinstance(payload, list) or len(payload) < 2:
+        raise WrapperMetadataError("Unexpected playlist payload structure.")
+
+    playlist_info = payload[0] or {}
+    items_section = payload[1] or {}
+
+    playlist = WrapperPlaylist(
+        uuid=playlist_info.get("uuid") or str(playlist_uuid),
+        name=playlist_info.get("title", "Unknown Playlist"),
+        description=playlist_info.get("description"),
+    )
+
+    tracks: list[WrapperTrack] = []
+
+    for entry in items_section.get("items", []):
+        track_data = entry.get("item") or entry
+        if not isinstance(track_data, dict):
+            continue
+
+        track_artists = _map_artists(track_data.get("artists") or [])
+        album_fragment = track_data.get("album") or {}
+        album = _build_album_from_fragment(album_fragment, track_artists)
+
+        track = _build_track(track_data, album)
+        tracks.append(track)
+
+    return playlist, tracks
 
 
 def instantiate_media_wrapper(media_type: MediaType, media_id: str) -> WrapperTrack:
