@@ -2,6 +2,7 @@
 import signal
 import sys
 from collections.abc import Callable
+from concurrent import futures
 from pathlib import Path
 from typing import Annotated
 from urllib.parse import urlparse
@@ -151,6 +152,56 @@ def _handle_album_playlist_mix_artist(
     return True
 
 
+def _download_tracks_collection(
+    dl: Download,
+    settings: Settings,
+    tracks: list,
+    file_template: str,
+    is_parent_album: bool,
+) -> set[Path]:
+    total = len(tracks)
+    result_dirs: set[Path] = set()
+
+    if total == 0:
+        return result_dirs
+
+    max_workers = max(1, settings.data.downloads_concurrent_max)
+
+    def _submit(index: int, track_obj):
+        delay_flag = bool(settings.data.download_delay and index < total - 1) if max_workers == 1 else False
+        return dl.item(
+            media=track_obj,
+            file_template=file_template,
+            quality_audio=settings.data.quality_audio,
+            quality_video=settings.data.quality_video,
+            download_delay=delay_flag,
+            is_parent_album=is_parent_album,
+            list_position=index + 1,
+            list_total=total,
+        )
+
+    with futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_map: dict[futures.Future, tuple[int, object]] = {
+            executor.submit(_submit, index, track): (index, track)
+            for index, track in enumerate(tracks)
+        }
+
+        for future in futures.as_completed(future_map):
+            index, track_obj = future_map[future]
+            try:
+                success, path_media = future.result()
+            except Exception as exc:  # pragma: no cover - best effort logging
+                dl.fn_logger.error(
+                    f"Failed to download '{getattr(track_obj, 'title', 'unknown track')}' (position {index + 1}): {exc}"
+                )
+                continue
+
+            if success and isinstance(path_media, Path):
+                result_dirs.add(path_media.parent)
+
+    return result_dirs
+
+
 def _download_album_anonymous(
     dl: Download,
     settings: Settings,
@@ -162,26 +213,9 @@ def _download_album_anonymous(
         dl.fn_logger.info(f"No tracks found for album '{album.name}'.")
         return
 
-    total = len(tracks)
-    result_dirs: set[Path] = set()
+    dl.fn_logger.info(f"Downloading album '{album.name}' with {len(tracks)} tracks via wrapper API.")
 
-    dl.fn_logger.info(f"Downloading album '{album.name}' with {total} tracks via wrapper API.")
-
-    for index, track in enumerate(tracks):
-        delay_flag = bool(settings.data.download_delay and index < total - 1)
-        success, path_media = dl.item(
-            media=track,
-            file_template=file_template,
-            quality_audio=settings.data.quality_audio,
-            quality_video=settings.data.quality_video,
-            download_delay=delay_flag,
-            is_parent_album=True,
-            list_position=index + 1,
-            list_total=total,
-        )
-
-        if success and isinstance(path_media, Path):
-            result_dirs.add(path_media.parent)
+    result_dirs = _download_tracks_collection(dl, settings, tracks, file_template, True)
 
     if settings.data.playlist_create and result_dirs:
         sort_by_track_num = "album_track_num" in file_template or "list_pos" in file_template
@@ -199,27 +233,12 @@ def _download_playlist_anonymous(
         dl.fn_logger.info(f"No tracks found for playlist '{playlist.name}'.")
         return
 
-    total = len(tracks)
-    result_dirs: set[Path] = set()
+    dl.fn_logger.info(f"Downloading playlist '{playlist.name}' with {len(tracks)} tracks via wrapper API.")
 
-    dl.fn_logger.info(f"Downloading playlist '{playlist.name}' with {total} tracks via wrapper API.")
-
-    for index, track in enumerate(tracks):
+    for track in tracks:
         setattr(track, "playlist_name", playlist.name)
-        delay_flag = bool(settings.data.download_delay and index < total - 1)
-        success, path_media = dl.item(
-            media=track,
-            file_template=file_template,
-            quality_audio=settings.data.quality_audio,
-            quality_video=settings.data.quality_video,
-            download_delay=delay_flag,
-            is_parent_album=False,
-            list_position=index + 1,
-            list_total=total,
-        )
 
-        if success and isinstance(path_media, Path):
-            result_dirs.add(path_media.parent)
+    result_dirs = _download_tracks_collection(dl, settings, tracks, file_template, False)
 
     if settings.data.playlist_create and result_dirs:
         sort_by_track_num = "album_track_num" in file_template or "list_pos" in file_template
@@ -237,27 +256,12 @@ def _download_mix_anonymous(
         dl.fn_logger.info(f"No tracks found for mix '{mix.name}'.")
         return
 
-    total = len(tracks)
-    result_dirs: set[Path] = set()
+    dl.fn_logger.info(f"Downloading mix '{mix.name}' with {len(tracks)} tracks via wrapper API.")
 
-    dl.fn_logger.info(f"Downloading mix '{mix.name}' with {total} tracks via wrapper API.")
-
-    for index, track in enumerate(tracks):
+    for track in tracks:
         track.mix_name = mix.name
-        delay_flag = bool(settings.data.download_delay and index < total - 1)
-        success, path_media = dl.item(
-            media=track,
-            file_template=file_template,
-            quality_audio=settings.data.quality_audio,
-            quality_video=settings.data.quality_video,
-            download_delay=delay_flag,
-            is_parent_album=False,
-            list_position=index + 1,
-            list_total=total,
-        )
 
-        if success and isinstance(path_media, Path):
-            result_dirs.add(path_media.parent)
+    result_dirs = _download_tracks_collection(dl, settings, tracks, file_template, False)
 
     if settings.data.playlist_create and result_dirs:
         sort_by_track_num = "album_track_num" in file_template or "list_pos" in file_template
