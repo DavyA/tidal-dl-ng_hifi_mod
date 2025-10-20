@@ -14,7 +14,7 @@ from tidalapi import Quality
 
 from tidal_dl_ng.constants import REQUESTS_TIMEOUT_SEC
 
-BASE_URL = "https://tidal.401658.xyz"
+BASE_URL = "https://hifi.401658.xyz"
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 MAX_RETRY_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = 0.5
