@@ -54,6 +54,13 @@ QUALITY_STRING_MAP: dict[Quality, str] = {
     Quality.hi_res_lossless: "HI_RES_LOSSLESS",
 }
 
+QUALITY_RANK: dict[str, int] = {
+    "LOW": 0,
+    "HIGH": 1,
+    "LOSSLESS": 2,
+    "HI_RES_LOSSLESS": 3,
+}
+
 
 def _quality_candidates(quality: Quality) -> list[str | None]:
     """Return fallback chain for a requested quality."""
@@ -131,8 +138,11 @@ def fetch_track_stream(
     high_quality_attempted_error = False
     high_quality_not_available = False
     high_quality_candidates = {None, "LOSSLESS"}
+    candidates = _quality_candidates(quality)
+    best_result: tuple[WrapperStreamManifest, WrappedStream, str] | None = None
+    best_rank = -1
 
-    for candidate in _quality_candidates(quality):
+    for idx, candidate in enumerate(candidates):
         params = params_base.copy()
         if candidate:
             params["quality"] = candidate
@@ -241,6 +251,23 @@ def fetch_track_stream(
             quality_reported = payload[0].get("audioQuality", "")
 
         quality_label = (quality_reported or candidate or "UNKNOWN").upper()
+
+        delivered_rank = QUALITY_RANK.get(quality_label, -1)
+        if delivered_rank > best_rank or best_result is None:
+            best_result = (manifest, stream, quality_label)
+            best_rank = delivered_rank
+
+        remaining_candidates = [c for c in candidates[idx + 1 :] if c]
+        max_remaining_rank = max((QUALITY_RANK.get(c, -1) for c in remaining_candidates), default=-1)
+        should_continue = delivered_rank < max_remaining_rank or (delivered_rank == -1 and max_remaining_rank >= 0)
+
+        if should_continue:
+            continue
+
+        break
+
+    if best_result:
+        manifest, stream, quality_label = best_result
 
         if quality_label in {"HIGH", "LOW"} and high_quality_attempted_error and not high_quality_not_available:
             errors.append("High-quality stream temporarily unavailable; received lower quality response.")
