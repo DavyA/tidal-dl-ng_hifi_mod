@@ -73,6 +73,9 @@ from tidal_dl_ng.wrapper_metadata import WrapperTrack
 TRACK_TYPES = (Track, WrapperTrack)
 MEDIA_ITEM_TYPES = TRACK_TYPES + (Video,)
 
+LOSSLESS_SOURCE_CODECS = {"FLAC", "ALAC"}
+CODECS_COPY_DIRECT_TO_FLAC = {"FLAC"}
+CODECS_REMUX_TO_M4A = {"EAC3", "EC3", "AC3"}
 
 # TODO: Set appropriate client string and use it for video download.
 # https://github.com/globocom/m3u8#using-different-http-clients
@@ -755,7 +758,7 @@ class Download:
             return True
 
         # Get stream information and final file extension
-        stream_manifest, file_extension, do_flac_extract, media_stream = self._get_stream_info(media)
+        stream_manifest, file_extension, do_flac_extract, do_m4a_remux, media_stream = self._get_stream_info(media)
 
         if stream_manifest is None and isinstance(media, TRACK_TYPES):
             return False
@@ -769,23 +772,37 @@ class Download:
 
         # Perform actual download
         return self._perform_actual_download(
-            media, path_media_dst, stream_manifest, do_flac_extract, is_parent_album, media_stream
+            media,
+            path_media_dst,
+            stream_manifest,
+            do_flac_extract,
+            do_m4a_remux,
+            is_parent_album,
+            media_stream,
         )
 
     def _get_stream_info(
         self, media: Track | WrapperTrack | Video
-    ) -> tuple[StreamManifest | WrapperStreamManifest | None, str, bool, Stream | WrappedStream | None]:
+    ) -> tuple[
+        StreamManifest | WrapperStreamManifest | None,
+        str,
+        bool,
+        bool,
+        Stream | WrappedStream | None,
+    ]:
         """Get stream information for media.
 
         Args:
             media (Track | WrapperTrack | Video): Media item.
 
         Returns:
-            tuple[StreamManifest | WrapperStreamManifest | None, str, bool, Stream | WrappedStream | None]: Stream info.
+            tuple[StreamManifest | WrapperStreamManifest | None, str, bool, bool, Stream | WrappedStream | None]:
+            (stream manifest, target extension, should extract FLAC, should remux to M4A, stream metadata).
         """
         stream_manifest: StreamManifest | WrapperStreamManifest | None = None
         media_stream: Stream | WrappedStream | None = None
         do_flac_extract: bool = False
+        do_m4a_remux: bool = False
 
         if isinstance(media, TRACK_TYPES):
             log_debug = getattr(self.fn_logger, "debug", None)
@@ -801,13 +818,13 @@ class Download:
                     f"Wrapper API could not provide stream data. Skipping '{name_builder_item(media)}'."
                 )
 
-                return None, "", False, None
+                return None, "", False, False, None
             except Exception:
                 self.fn_logger.exception(
                     f"Unexpected error while contacting wrapper API. Skipping '{name_builder_item(media)}'."
                 )
 
-                return None, "", False, None
+                return None, "", False, False, None
 
             requested_quality_label = QUALITY_STRING_MAP.get(self.session.audio_quality, "").upper()
             delivered_quality_label = delivered_quality.upper() if isinstance(delivered_quality, str) else ""
@@ -824,18 +841,18 @@ class Download:
 
             file_extension = stream_manifest.file_extension
 
-            if (
-                self.settings.data.extract_flac
-                and stream_manifest.codecs
-                and stream_manifest.codecs.upper() == Codec.FLAC
-                and file_extension != AudioExtensions.FLAC
-            ):
-                file_extension = AudioExtensions.FLAC
-                do_flac_extract = True
+            codec_upper = (stream_manifest.codecs or "").upper()
+            if self.settings.data.extract_flac:
+                if codec_upper in LOSSLESS_SOURCE_CODECS and file_extension != AudioExtensions.FLAC:
+                    file_extension = AudioExtensions.FLAC
+                    do_flac_extract = True
+                elif codec_upper in CODECS_REMUX_TO_M4A and file_extension != AudioExtensions.M4A:
+                    file_extension = AudioExtensions.M4A
+                    do_m4a_remux = True
         elif isinstance(media, Video):
             file_extension = AudioExtensions.MP4 if self.settings.data.video_convert_mp4 else VideoExtensions.TS
 
-        return stream_manifest, file_extension, do_flac_extract, media_stream
+        return stream_manifest, file_extension, do_flac_extract, do_m4a_remux, media_stream
 
     def _perform_actual_download(
         self,
@@ -843,6 +860,7 @@ class Download:
         path_media_dst: pathlib.Path,
         stream_manifest: StreamManifest | WrapperStreamManifest | None,
         do_flac_extract: bool,
+        do_m4a_remux: bool,
         is_parent_album: bool,
         media_stream: Stream | WrappedStream | None,
     ) -> bool:
@@ -853,6 +871,7 @@ class Download:
             path_media_dst (pathlib.Path): Destination file path.
             stream_manifest (StreamManifest | WrapperStreamManifest | None): Stream manifest object.
             do_flac_extract (bool): Whether to extract FLAC.
+            do_m4a_remux (bool): Whether to remux the audio-only MP4 into M4A.
             is_parent_album (bool): Whether this is a parent album.
             media_stream (Stream | WrappedStream | None): Media stream metadata.
 
@@ -876,9 +895,12 @@ class Download:
             if isinstance(media, Video) and self.settings.data.video_convert_mp4:
                 tmp_path_file = self._video_convert(tmp_path_file)
 
-            # Extract FLAC from MP4 container using ffmpeg
+            # Extract / remux audio containers when requested
+            source_codec = getattr(stream_manifest, "codecs", None) if stream_manifest else None
             if isinstance(media, TRACK_TYPES) and self.settings.data.extract_flac and do_flac_extract:
-                tmp_path_file = self._extract_flac(tmp_path_file)
+                tmp_path_file = self._extract_flac(tmp_path_file, source_codec)
+            elif isinstance(media, TRACK_TYPES) and do_m4a_remux:
+                tmp_path_file = self._remux_to_m4a(tmp_path_file, source_codec)
 
             # Handle metadata, lyrics, and cover
             self._handle_metadata_and_extras(media, tmp_path_file, path_media_dst, is_parent_album, media_stream)
@@ -1607,27 +1629,77 @@ class Download:
 
         return path_file_out
 
-    def _extract_flac(self, path_media_src: pathlib.Path) -> pathlib.Path:
+    def _remux_to_m4a(self, path_media_src: pathlib.Path, source_codec: str | None = None) -> pathlib.Path:
+        """Remux an audio-only MP4 container to M4A without re-encoding.
+
+        Falls back to a simple rename when the contained codec is not
+        supported by the M4A flavour (e.g. Dolby Atmos EC-3).
+        """
+        path_media_out = path_media_src.with_suffix(AudioExtensions.M4A)
+        codec_value = getattr(source_codec, "value", source_codec) if source_codec is not None else ""
+        codec_upper = str(codec_value).upper()
+
+        remux_supported = codec_upper and codec_upper not in CODECS_REMUX_TO_M4A
+
+        if remux_supported:
+            ffmpeg = (
+                FFmpeg(executable=self.settings.data.path_binary_ffmpeg)
+                .input(url=path_media_src)
+                .output(
+                    url=path_media_out,
+                    map=0,
+                    acodec="copy",
+                    movflags="use_metadata_tags",
+                    loglevel="quiet",
+                )
+            )
+
+            try:
+                ffmpeg.execute()
+            except Exception as exc:  # pragma: no cover - depends on system ffmpeg build.
+                if path_media_out.exists():
+                    path_media_out.unlink()
+                self.fn_logger.warning("FFmpeg remux to M4A failed (%s); falling back to container rename.", exc)
+            else:
+                path_media_src.unlink(missing_ok=True)
+                return path_media_out
+
+        if path_media_out.exists():
+            path_media_out.unlink()
+
+        path_media_src.rename(path_media_out)
+        return path_media_out
+
+    def _extract_flac(self, path_media_src: pathlib.Path, source_codec: str | None = None) -> pathlib.Path:
         """Extract FLAC audio from a media file using ffmpeg.
 
         Args:
             path_media_src (pathlib.Path): Path to the source media file.
+            source_codec (str | None): Codec string reported by the manifest, used to decide whether to copy or transcode (and downmix).
 
         Returns:
             pathlib.Path: Path to the extracted FLAC file.
         """
         path_media_out = path_media_src.with_suffix(AudioExtensions.FLAC)
+        codec_value = getattr(source_codec, "value", source_codec) if source_codec is not None else ""
+        codec_upper = str(codec_value).upper()
+        copy_direct = codec_upper in CODECS_COPY_DIRECT_TO_FLAC
+
+        output_kwargs = {
+            "url": path_media_out,
+            "map": 0,
+            "map_metadata": "0",
+            "loglevel": "quiet",
+            "acodec": "copy" if copy_direct else "flac",
+        }
+
+        if copy_direct:
+            output_kwargs["movflags"] = "use_metadata_tags"
+
         ffmpeg = (
             FFmpeg(executable=self.settings.data.path_binary_ffmpeg)
             .input(url=path_media_src)
-            .output(
-                url=path_media_out,
-                map=0,
-                movflags="use_metadata_tags",
-                acodec="copy",
-                map_metadata="0:g",
-                loglevel="quiet",
-            )
+            .output(**output_kwargs)
         )
 
         ffmpeg.execute()

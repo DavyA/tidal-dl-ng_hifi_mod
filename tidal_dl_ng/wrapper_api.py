@@ -54,6 +54,26 @@ QUALITY_STRING_MAP: dict[Quality, str] = {
     Quality.hi_res_lossless: "HI_RES_LOSSLESS",
 }
 
+QUALITY_LABEL_ALIASES: dict[str, str] = {
+    "LOW_RES": "LOW",
+    "LOWRES": "LOW",
+    "NORMAL": "LOW",
+    "STANDARD": "LOW",
+    "HIGH_RES": "HI_RES_LOSSLESS",
+    "HIGHRES": "HI_RES_LOSSLESS",
+    "HI_RES": "HI_RES_LOSSLESS",
+    "HIREZ": "HI_RES_LOSSLESS",
+    "HIRES": "HI_RES_LOSSLESS",
+    "HI_RES_FLAC": "HI_RES_LOSSLESS",
+    "HI_RES_LOSSLESS": "HI_RES_LOSSLESS",
+    "HIFI": "LOSSLESS",
+    "HI_FI": "LOSSLESS",
+    "HI-FI": "LOSSLESS",
+    "LOSSLESS_FLAC": "LOSSLESS",
+    "MASTER": "HI_RES_LOSSLESS",
+    "MQA": "HI_RES_LOSSLESS",
+}
+
 QUALITY_RANK: dict[str, int] = {
     "LOW": 0,
     "HIGH": 1,
@@ -114,6 +134,17 @@ def _request_with_retry(params: dict[str, str], *, attempts: int = MAX_RETRY_ATT
     return None, last_error or "request failed"
 
 
+def _normalize_quality_label(label: str | None) -> str | None:
+    if label is None:
+        return None
+
+    normalized = str(label).strip().upper().replace("-", "_").replace(" ", "_")
+    if not normalized:
+        return None
+
+    return QUALITY_LABEL_ALIASES.get(normalized, normalized)
+
+
 def fetch_track_stream(
     track_id: str | int,
     quality: Quality,
@@ -137,7 +168,7 @@ def fetch_track_stream(
     params_base = {"id": str(track_id)}
     high_quality_attempted_error = False
     high_quality_not_available = False
-    high_quality_candidates = {None, "LOSSLESS"}
+    high_quality_candidates = {None, QUALITY_STRING_MAP[Quality.high_lossless], QUALITY_STRING_MAP[Quality.hi_res_lossless]}
     candidates = _quality_candidates(quality)
     best_result: tuple[WrapperStreamManifest, WrappedStream, str] | None = None
     best_rank = -1
@@ -246,11 +277,33 @@ def fetch_track_stream(
             track_peak_amplitude=manifest_info.get("trackPeakAmplitude", 0.0),
         )
 
-        quality_reported = manifest_info.get("audioQuality")
-        if not quality_reported and payload and isinstance(payload[0], dict):
-            quality_reported = payload[0].get("audioQuality", "")
+        quality_reported_raw = manifest_info.get("audioQuality")
+        audio_mode = manifest_info.get("audioMode")
+        audio_modes = manifest_info.get("audioModes")
+        if quality_reported_raw in (None, "") and payload and isinstance(payload[0], dict):
+            quality_reported_raw = payload[0].get("audioQuality", "")
+            audio_mode = audio_mode or payload[0].get("audioMode")
+            audio_modes = audio_modes or payload[0].get("audioModes")
 
-        quality_label = (quality_reported or candidate or "UNKNOWN").upper()
+        modes: list[str] = []
+        if isinstance(audio_modes, str):
+            modes.append(audio_modes)
+        elif isinstance(audio_modes, Iterable):
+            modes.extend(str(mode) for mode in audio_modes if mode)
+
+        if audio_mode:
+            modes.append(str(audio_mode))
+
+        normalized_modes = {mode.upper() for mode in modes if mode}
+        atmos_detected = any("ATMOS" in mode for mode in normalized_modes)
+
+        quality_label = _normalize_quality_label(quality_reported_raw)
+        candidate_label = _normalize_quality_label(candidate) if candidate else None
+        quality_label = quality_label or candidate_label or "UNKNOWN"
+
+        if atmos_detected and quality_label in {"LOW", "UNKNOWN"}:
+            # Atmos masters sometimes report LOW quality even though they are lossless streams.
+            quality_label = QUALITY_STRING_MAP[Quality.high_lossless]
 
         delivered_rank = QUALITY_RANK.get(quality_label, -1)
         if delivered_rank > best_rank or best_result is None:
