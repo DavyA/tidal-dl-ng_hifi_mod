@@ -76,9 +76,10 @@ QUALITY_LABEL_ALIASES: dict[str, str] = {
 
 QUALITY_RANK: dict[str, int] = {
     "LOW": 0,
-    "HIGH": 1,
-    "LOSSLESS": 2,
-    "HI_RES_LOSSLESS": 3,
+    "HIGH_ATMOS": 1,
+    "HIGH": 2,
+    "LOSSLESS": 3,
+    "HI_RES_LOSSLESS": 4,
 }
 
 
@@ -303,7 +304,7 @@ def fetch_track_stream(
 
         if atmos_detected and quality_label in {"LOW", "UNKNOWN"}:
             # Atmos masters sometimes report LOW quality even though they are lossless streams.
-            quality_label = QUALITY_STRING_MAP[Quality.high_lossless]
+            quality_label = QUALITY_STRING_MAP[Quality.high_atmos]
 
         delivered_rank = QUALITY_RANK.get(quality_label, -1)
         if delivered_rank > best_rank or best_result is None:
