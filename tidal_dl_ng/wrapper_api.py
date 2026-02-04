@@ -14,7 +14,7 @@ from tidalapi import Quality
 
 from tidal_dl_ng.constants import REQUESTS_TIMEOUT_SEC
 
-BASE_URL = "https://hifi.401658.xyz"
+BASE_URL = "https://wolf.qqdl.site"
 RETRY_STATUS_CODES = {429, 500, 502, 503, 504}
 MAX_RETRY_ATTEMPTS = 3
 RETRY_BACKOFF_SECONDS = 0.5
@@ -100,6 +100,30 @@ def _decode_manifest(manifest_payload: str) -> dict:
     return json.loads(decoded_bytes)
 
 
+def _extract_stream_payload(payload) -> tuple[str | None, dict | None, dict | None, str | None]:
+    """Normalize wrapper responses from legacy list form and newer dict form."""
+
+    if isinstance(payload, dict):
+        if payload.get("detail") and not payload.get("data"):
+            return None, None, None, str(payload.get("detail"))
+
+        data_section = payload.get("data")
+        if isinstance(data_section, dict):
+            return data_section.get("manifest"), data_section, data_section, None
+
+        return None, None, None, "unexpected payload"
+
+    if isinstance(payload, list):
+        if len(payload) < 2:
+            return None, None, None, "unexpected payload"
+
+        headline = payload[0] or {}
+        track_info = payload[1] or {}
+        return track_info.get("manifest"), track_info, headline, None
+
+    return None, None, None, "unexpected payload"
+
+
 def _derive_file_extension(urls: Iterable[str]) -> str:
     for url in urls:
         suffix = Path(urlparse(url).path).suffix
@@ -109,15 +133,21 @@ def _derive_file_extension(urls: Iterable[str]) -> str:
     return ".m4a"
 
 
-def _request_with_retry(params: dict[str, str], *, attempts: int = MAX_RETRY_ATTEMPTS):
+def request_with_retry(
+    endpoint: str,
+    params: dict[str, str | int],
+    *,
+    attempts: int = MAX_RETRY_ATTEMPTS,
+):
     """Perform a wrapper request with simple retry/backoff for transient errors."""
 
     last_error: str | None = None
+    url = f"{BASE_URL}/{endpoint}"
 
     for attempt in range(attempts):
         try:
             response = requests.get(
-                f"{BASE_URL}/track",
+                url,
                 params=params,
                 timeout=REQUESTS_TIMEOUT_SEC,
             )
@@ -179,7 +209,7 @@ def fetch_track_stream(
         if candidate:
             params["quality"] = candidate
 
-        response, retry_error = _request_with_retry(params)
+        response, retry_error = request_with_retry("track", params)
 
         if response is None:
             if candidate in high_quality_candidates:
@@ -220,24 +250,21 @@ def fetch_track_stream(
                 high_quality_attempted_error = True
             continue
 
-        if isinstance(payload, dict):
-            detail = payload.get("detail")
-            if detail:
-                errors.append(f"{candidate or 'DEFAULT'}: {detail}")
-                if candidate in high_quality_candidates and "quality not found" in detail.lower():
+        manifest_encoded, track_info, headline, payload_error = _extract_stream_payload(payload)
+        if payload_error:
+            errors.append(f"{candidate or 'DEFAULT'}: {payload_error}")
+            if candidate in high_quality_candidates:
+                if "quality not found" in payload_error.lower():
                     high_quality_not_available = True
-                elif candidate in high_quality_candidates:
+                else:
                     high_quality_attempted_error = True
             continue
 
-        if not isinstance(payload, list) or len(payload) < 2:
+        if not manifest_encoded or not isinstance(track_info, dict):
             errors.append(f"{candidate or 'DEFAULT'}: unexpected payload")
             if candidate in high_quality_candidates:
                 high_quality_attempted_error = True
             continue
-
-        manifest_info = payload[1] or {}
-        manifest_encoded = manifest_info.get("manifest")
 
         if not manifest_encoded:
             errors.append(f"{candidate or 'DEFAULT'}: missing manifest")
@@ -247,7 +274,7 @@ def fetch_track_stream(
 
         try:
             manifest_decoded = _decode_manifest(manifest_encoded)
-        except (json.JSONDecodeError, ValueError) as exc:
+        except (json.JSONDecodeError, ValueError, base64.binascii.Error) as exc:
             errors.append(f"{candidate or 'DEFAULT'}: manifest decode failed ({exc})")
             if candidate in high_quality_candidates:
                 high_quality_attempted_error = True
@@ -272,19 +299,19 @@ def fetch_track_stream(
         )
 
         stream = WrappedStream(
-            album_replay_gain=manifest_info.get("albumReplayGain", 0.0),
-            album_peak_amplitude=manifest_info.get("albumPeakAmplitude", 0.0),
-            track_replay_gain=manifest_info.get("trackReplayGain", 0.0),
-            track_peak_amplitude=manifest_info.get("trackPeakAmplitude", 0.0),
+            album_replay_gain=track_info.get("albumReplayGain", 0.0),
+            album_peak_amplitude=track_info.get("albumPeakAmplitude", 0.0),
+            track_replay_gain=track_info.get("trackReplayGain", 0.0),
+            track_peak_amplitude=track_info.get("trackPeakAmplitude", 0.0),
         )
 
-        quality_reported_raw = manifest_info.get("audioQuality")
-        audio_mode = manifest_info.get("audioMode")
-        audio_modes = manifest_info.get("audioModes")
-        if quality_reported_raw in (None, "") and payload and isinstance(payload[0], dict):
-            quality_reported_raw = payload[0].get("audioQuality", "")
-            audio_mode = audio_mode or payload[0].get("audioMode")
-            audio_modes = audio_modes or payload[0].get("audioModes")
+        quality_reported_raw = track_info.get("audioQuality")
+        audio_mode = track_info.get("audioMode")
+        audio_modes = track_info.get("audioModes")
+        if isinstance(headline, dict):
+            quality_reported_raw = quality_reported_raw or headline.get("audioQuality", "")
+            audio_mode = audio_mode or headline.get("audioMode")
+            audio_modes = audio_modes or headline.get("audioModes")
 
         modes: list[str] = []
         if isinstance(audio_modes, str):
@@ -304,7 +331,8 @@ def fetch_track_stream(
 
         if atmos_detected and quality_label in {"LOW", "UNKNOWN"}:
             # Atmos masters sometimes report LOW quality even though they are lossless streams.
-            quality_label = QUALITY_STRING_MAP[Quality.high_atmos]
+            # Use LOSSLESS for Atmos to ensure correct ranking/handling if map is missing it or maps strangely.
+            quality_label = "LOSSLESS"
 
         delivered_rank = QUALITY_RANK.get(quality_label, -1)
         if delivered_rank > best_rank or best_result is None:

@@ -4,12 +4,14 @@ import datetime
 from dataclasses import dataclass
 from typing import Iterable
 
+import json
 import requests
 from tidalapi.artist import Role
 
 from tidal_dl_ng.constants import CoverDimensions, REQUESTS_TIMEOUT_SEC
 from tidal_dl_ng.constants import MediaType
-from tidal_dl_ng.wrapper_api import BASE_URL
+from tidal_dl_ng.wrapper_api import BASE_URL, request_with_retry
+from tidal_dl_ng.wrapper_api import WrapperApiError
 
 
 class WrapperMetadataError(Exception):
@@ -108,9 +110,48 @@ class WrapperMix:
 
 
 def _request(endpoint: str, params: dict[str, str | int]) -> dict | list:
-    response = requests.get(f"{BASE_URL}/{endpoint}", params=params, timeout=REQUESTS_TIMEOUT_SEC)
-    response.raise_for_status()
-    return response.json()
+    resp, error = request_with_retry(endpoint, params)
+    if resp and resp.status_code == 200:
+        return resp.json()
+
+    if resp:
+        msg = f"HTTP {resp.status_code}"
+    else:
+        msg = error or "network error"
+
+    raise WrapperMetadataError(f"Failed to retrieve metadata from {endpoint}: {msg}")
+
+
+def _get_json_response(endpoint: str, params: dict[str, str | int]) -> tuple[int, dict | list | None]:
+    """Perform a GET request and return (status_code, payload)."""
+
+    resp, _ = request_with_retry(endpoint, params)
+    if resp:
+        try:
+            return resp.status_code, resp.json()
+        except json.JSONDecodeError:
+            return resp.status_code, None
+    
+    # If generic retry failed completely (e.g. max retries exceeded for 500s),
+    # we simulate a 503 or return 0 to indicate failure, but raising might be better.
+    # For now, let's raise to be safe or return 503 so logic downstream handles it.
+    raise WrapperMetadataError(f"Failed to retrieve track metadata: network error")
+
+
+def _extract_track_id(payload: dict | list | None) -> int | None:
+    """Try to extract a track identifier from various payload shapes."""
+    if isinstance(payload, dict):
+        data = payload.get("data") if "data" in payload else payload
+        if isinstance(data, dict):
+            return data.get("trackId") or data.get("id")
+
+    if isinstance(payload, list):
+        for entry in payload:
+            if isinstance(entry, dict):
+                tid = entry.get("trackId") or entry.get("id")
+                if tid:
+                    return tid
+    return None
 
 
 def _parse_date(date_str: str | None, date_format: str) -> datetime.datetime | None:
@@ -144,6 +185,34 @@ def _map_artists(artists: Iterable[dict]) -> list[WrapperArtist]:
         )
 
     return result
+
+
+def _normalize_album_fragment(
+    fragment: dict | None, track_data: dict | None = None, total_tracks: int | None = None
+) -> dict:
+    """Fill missing album fields using track-level data or collection counts."""
+
+    normalized = dict(fragment or {})
+
+    if track_data:
+        stream_start = track_data.get("streamStartDate")
+        if stream_start and isinstance(stream_start, str):
+            normalized.setdefault("streamStartDate", stream_start)
+            normalized.setdefault("releaseDate", stream_start.split("T", 1)[0])
+
+        if (allow_streaming := track_data.get("allowStreaming")) is not None:
+            normalized.setdefault("allowStreaming", allow_streaming)
+
+        if (explicit := track_data.get("explicit")) is not None:
+            normalized.setdefault("explicit", explicit)
+
+        if (volume_number := track_data.get("volumeNumber")):
+            normalized.setdefault("numberOfVolumes", volume_number)
+
+    if total_tracks is not None and not normalized.get("numberOfTracks"):
+        normalized["numberOfTracks"] = total_tracks
+
+    return normalized
 
 
 def _build_album(album_data: dict) -> WrapperAlbum:
@@ -194,31 +263,44 @@ def _build_track(track_data: dict, album: WrapperAlbum) -> WrapperTrack:
 
 def fetch_track_metadata(track_id: str | int) -> WrapperTrack:
     """Retrieve track metadata using the wrapper API."""
-    try:
-        payload = _request("track", {"id": track_id})
-    except requests.RequestException as exc:
-        raise WrapperMetadataError(f"Failed to retrieve track metadata: {exc}") from exc
+    status, payload = _get_json_response("info", {"id": track_id})
 
-    if not isinstance(payload, list) or not payload:
+    # Wrapper sometimes knows a different trackId; try to resolve via /track when /info says 404.
+    if status == 404:
+        track_status, track_payload = _get_json_response("track", {"id": track_id})
+        mapped_track_id = _extract_track_id(track_payload) if track_status < 400 else None
+        if mapped_track_id and str(mapped_track_id) != str(track_id):
+            status, payload = _get_json_response("info", {"id": mapped_track_id})
+            track_id = mapped_track_id
+
+    if status >= 400 or payload is None:
+        detail = ""
+        if isinstance(payload, dict):
+            detail = str(payload.get("detail") or "")
+        raise WrapperMetadataError(f"Failed to retrieve track metadata: {detail or f'HTTP {status}'}")
+
+    if isinstance(payload, dict) and payload.get("detail"):
+        raise WrapperMetadataError(str(payload.get("detail")))
+
+    if isinstance(payload, dict):
+        track_data = payload.get("data") or {}
+    elif isinstance(payload, list) and payload:
+        track_data = payload[0]
+    else:
+        track_data = {}
+
+    if not isinstance(track_data, dict) or not track_data:
         raise WrapperMetadataError("Unexpected track payload structure.")
 
-    track_data: dict = payload[0]
     album_ref = track_data.get("album") or {}
     album_id = album_ref.get("id")
 
     if album_id is None:
         raise WrapperMetadataError("Track payload is missing album information.")
 
-    try:
-        album_payload = _request("album", {"id": album_id})
-    except requests.RequestException as exc:
-        raise WrapperMetadataError(f"Failed to retrieve album metadata: {exc}") from exc
-
-    if not isinstance(album_payload, list) or not album_payload:
-        raise WrapperMetadataError("Unexpected album payload structure.")
-
-    album_data = album_payload[0]
-    album = _build_album(album_data)
+    album_fragment = _normalize_album_fragment(album_ref, track_data)
+    album_fragment.setdefault("id", album_id)
+    album = _build_album(album_fragment)
 
     return _build_track(track_data, album)
 
@@ -248,17 +330,56 @@ def fetch_album_with_tracks(album_id: str | int) -> tuple[WrapperAlbum, list[Wra
     except requests.RequestException as exc:
         raise WrapperMetadataError(f"Failed to retrieve album metadata: {exc}") from exc
 
-    if not isinstance(payload, list) or len(payload) < 2:
+    album_data: dict | None = None
+    items: list = []
+
+    if isinstance(payload, dict):
+        if payload.get("detail"):
+            raise WrapperMetadataError(str(payload.get("detail")))
+
+        data_section = payload.get("data") or {}
+        raw_items = data_section.get("items") or []
+        track_entries: list[dict] = []
+
+        for entry in raw_items:
+            track_data = entry.get("item") if isinstance(entry, dict) else entry
+            if isinstance(track_data, dict):
+                track_entries.append(track_data)
+
+        if track_entries:
+            total_tracks = data_section.get("totalNumberOfItems")
+            album_fragment = track_entries[0].get("album") or {}
+            album_data = _normalize_album_fragment(album_fragment, track_entries[0], total_tracks)
+            album_data.setdefault("id", album_id)
+            if total_tracks:
+                album_data.setdefault("numberOfTracks", total_tracks)
+            album_data.setdefault("numberOfVolumes", max((track.get("volumeNumber") or 1) for track in track_entries))
+            if not album_data.get("explicit"):
+                album_data["explicit"] = any(bool(track.get("explicit")) for track in track_entries)
+
+        items = track_entries
+
+    elif isinstance(payload, list) and len(payload) >= 2:
+        album_data = payload[0] or {}
+        items_section = payload[1] or {}
+        raw_items = items_section.get("items") or []
+        items = []
+        for entry in raw_items:
+            track_data = entry.get("item") if isinstance(entry, dict) else entry
+            if isinstance(track_data, dict):
+                items.append(track_data)
+
+    if album_data is None:
         raise WrapperMetadataError("Unexpected album payload structure.")
 
-    album_data = payload[0] or {}
-    items_section = payload[1] or {}
     album = _build_album(album_data)
 
     tracks: list[WrapperTrack] = []
 
-    for entry in items_section.get("items", []):
-        track_data = entry.get("item") or entry
+    for entry in items:
+        track_data = entry.get("item") if isinstance(entry, dict) else entry
+        if track_data is None and isinstance(entry, dict):
+            track_data = entry
         if not isinstance(track_data, dict):
             continue
 
@@ -274,11 +395,18 @@ def fetch_playlist_with_tracks(playlist_uuid: str) -> tuple[WrapperPlaylist, lis
     except requests.RequestException as exc:
         raise WrapperMetadataError(f"Failed to retrieve playlist metadata: {exc}") from exc
 
-    if not isinstance(payload, list) or len(payload) < 2:
-        raise WrapperMetadataError("Unexpected playlist payload structure.")
+    if isinstance(payload, dict) and payload.get("detail"):
+        raise WrapperMetadataError(str(payload.get("detail")))
 
-    playlist_info = payload[0] or {}
-    items_section = payload[1] or {}
+    if isinstance(payload, dict):
+        playlist_info = payload.get("playlist") or {}
+        items = payload.get("items") or []
+    elif isinstance(payload, list) and len(payload) >= 2:
+        playlist_info = payload[0] or {}
+        items_section = payload[1] or {}
+        items = items_section.get("items") or []
+    else:
+        raise WrapperMetadataError("Unexpected playlist payload structure.")
 
     playlist = WrapperPlaylist(
         uuid=playlist_info.get("uuid") or str(playlist_uuid),
@@ -288,13 +416,13 @@ def fetch_playlist_with_tracks(playlist_uuid: str) -> tuple[WrapperPlaylist, lis
 
     tracks: list[WrapperTrack] = []
 
-    for entry in items_section.get("items", []):
+    for entry in items:
         track_data = entry.get("item") or entry
         if not isinstance(track_data, dict):
             continue
 
         track_artists = _map_artists(track_data.get("artists") or [])
-        album_fragment = track_data.get("album") or {}
+        album_fragment = _normalize_album_fragment(track_data.get("album"), track_data)
         album = _build_album_from_fragment(album_fragment, track_artists)
 
         track = _build_track(track_data, album)
